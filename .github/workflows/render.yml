@@ -2,27 +2,68 @@ name: Render Lion Animation
 
 on:
   workflow_dispatch:
+    inputs:
+      quality:
+        description: "draft = quick low-res test, final = full 1080x1920"
+        type: choice
+        default: draft
+        options: [draft, final]
+  push:
+    paths: ["Lion_animation.py"]
 
 jobs:
   render:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    env:
+      QUALITY: ${{ github.event.inputs.quality || 'draft' }}
+      CHUNK: ${{ matrix.chunk }}
+      CHUNKS: 10
     steps:
-      - name: Download project
-        uses: actions/checkout@v4
-
-      - name: Install Blender
+      - uses: actions/checkout@v4
+      - name: Install Blender 4.2 LTS
         run: |
           sudo apt-get update
-          sudo apt-get install -y blender
-
-      - name: Render animation
-        run: |
-          blender -b -P Lion_animation.py
-
-      - name: Save video
-        uses: actions/upload-artifact@v4
+          sudo apt-get install -y libegl1 libgl1 libgl1-mesa-dri libxkbcommon0 libxi6 libxrender1 libxxf86vm1 libxfixes3 libsm6 libxext6 xz-utils
+          V=""
+          for v in 4.2.3 4.2.2 4.2.0; do
+            if wget -q "https://download.blender.org/release/Blender4.2/blender-$v-linux-x64.tar.xz"; then V=$v; break; fi
+          done
+          tar -xf "blender-$V-linux-x64.tar.xz"
+          echo "$PWD/blender-$V-linux-x64" >> "$GITHUB_PATH"
+      - name: Render frames
+        run: blender -b -P Lion_animation.py
+      - uses: actions/upload-artifact@v4
         with:
-          name: Lion-Animation
-          path: "**/*.mp4"
-          if-no-files-found: error
+          name: frames-${{ matrix.chunk }}
+          path: frames/*.png
+          retention-days: 1
+          compression-level: 0
+
+  video:
+    needs: render
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: frames-*
+          merge-multiple: true
+          path: frames
+      - name: Make MP4
+        run: |
+          sudo apt-get install -y ffmpeg
+          ffmpeg -y -framerate 30 -i frames/frame_%04d.png -c:v libx264 -crf 16 -preset medium -pix_fmt yuv420p -movflags +faststart Lion_King_of_the_Forest.mp4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lion-video
+          path: Lion_King_of_the_Forest.mp4
+      - name: Publish as a release (easy download on phone)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "lion-${{ github.run_number }}" Lion_King_of_the_Forest.mp4 --repo "${{ github.repository }}" --title "Lion render ${{ github.run_number }}" --notes "Rendered on GitHub Actions"
