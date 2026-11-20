@@ -3,26 +3,26 @@ KING OF THE FOREST  -  cinematic 3D lion animation (Blender Python)
 =====================================================================
 A majestic procedural lion (fur shader, flowing mane, whiskers, blinking eyes, IK walk cycle)
 walks through a sunlit forest. Camera dollies in; at the end the lion stops and looks straight
-into the lens. 7 s | 1080x1920 (9:16) | 30 FPS | MP4 (H.264)
+into the lens. 7 s | 1080x1920 (9:16) | 30 FPS
 
-HOW TO USE
-  1. Open Blender (4.2 LTS or newer recommended; 3.6+ is supported).
-  2. Scripting workspace -> Open -> choose this file -> Run Script (Alt+P). Building takes a few seconds.
-  3. Press Space over the 3D viewport to preview the animation.
-  4. Render > Render Animation (Ctrl+F12). The MP4 is written next to your .blend file
-     (or into ~/Blender_Output if the .blend has not been saved).
-  Headless:  blender -b -P 01_King_of_the_Forest.py     (builds and renders by itself)
+ON YOUR OWN COMPUTER
+  Scripting workspace -> Open -> this file -> Run Script (Alt+P), then Render > Render Animation.
+  Headless:  blender -b -P Lion_animation.py          (writes an MP4 next to the .blend / ~/Blender_Output)
+  Settings just below the imports: RENDER_ENGINE ("EEVEE" fast / "CYCLES" realistic), SAMPLES,
+  RESOLUTION_PERCENT, and USE_VOLUMETRICS further down.
 
-SETTINGS you may want to change (just below the imports, and USE_VOLUMETRICS further down):
-  RENDER_ENGINE = "EEVEE" (fast) or "CYCLES" (slower, more realistic)
-  SAMPLES, RESOLUTION_PERCENT (50 = quick preview render), USE_VOLUMETRICS (god-ray haze)
+ON GITHUB ACTIONS (no GPU there)
+  The script detects GITHUB_ACTIONS=true and switches itself to Cycles-on-CPU, writes PNG frames
+  (only its own CHUNK of CHUNKS), and the workflow stitches them into an MP4 with ffmpeg.
 """
 import bpy
 import bmesh
 import math
 import os
 import random
+import sys
 import traceback
+import warnings
 
 # ============================================================================
 #  USER SETTINGS
@@ -39,6 +39,36 @@ DURATION = 7
 F_START = 1
 F_END = FPS * DURATION       # 210 frames = exactly 7.0 seconds
 RES_X, RES_Y = 1080, 1920    # vertical 9:16
+
+# ---- headless / GitHub Actions mode (switches on by itself when GITHUB_ACTIONS=true) ----------
+# GitHub servers have no GPU, so EEVEE cannot start there (libEGL error). In this mode the script
+# renders with Cycles on the CPU, writes PNG frames, and can render just one slice (CHUNK/CHUNKS)
+# so many jobs can work in parallel. Env vars: QUALITY=draft|final, CHUNK, CHUNKS, SAMPLES, RES_PERCENT
+ENV = os.environ
+IS_CI = ENV.get('GITHUB_ACTIONS', '').lower() == 'true' or ENV.get('FORCE_CI_MODE', '') == '1'
+CHUNK = int(ENV.get('CHUNK') or -1)
+CHUNKS = max(1, int(ENV.get('CHUNKS') or 1))
+if IS_CI:
+    RENDER_ENGINE = "CYCLES"
+    MOTION_BLUR = False
+    if ENV.get('QUALITY', 'final').lower() == 'draft':
+        SAMPLES, RESOLUTION_PERCENT = 6, 40                       # 432x768, quick test
+    else:
+        SAMPLES = int(ENV.get('SAMPLES') or 32)
+        RESOLUTION_PERCENT = int(ENV.get('RES_PERCENT') or 100)
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)    # Blender 5.x warns about use_nodes (harmless)
+try:
+    sys.stdout.reconfigure(line_buffering=True)                   # live log lines in CI
+except Exception:
+    pass
+
+
+def frame_slice():
+    if CHUNK < 0:
+        return F_START, F_END
+    n = F_END - F_START + 1
+    return F_START + (n * CHUNK) // CHUNKS, F_START + (n * (CHUNK + 1)) // CHUNKS - 1
 
 
 # ============================================================================
@@ -722,7 +752,10 @@ def add_volume_box(center, size, density, color=(1, 1, 1), aniso=0.0, name="Haze
 
 @safe
 def add_glare(scene, threshold=0.9, size=8, mix=-0.3):
-    """Optional compositor bloom. Skipped silently if this Blender version differs."""
+    """Optional compositor bloom. Skipped quietly where scene.node_tree does not exist (Blender 5.x)."""
+    if IS_CI or not hasattr(scene, 'node_tree'):
+        print("[info] compositor glare skipped on this setup")
+        return
     scene.use_nodes = True
     tree = scene.node_tree
     if tree is None:
@@ -748,6 +781,57 @@ def add_glare(scene, threshold=0.9, size=8, mix=-0.3):
 # ============================================================================
 #  RENDER SETTINGS + MP4 EXPORT
 # ============================================================================
+@safe
+def add_mist_fog(scene, color=(1.0, 0.82, 0.55), start=10.0, depth=70.0, strength=0.6):
+    """Cheap atmospheric haze for CPU/Cycles renders (compositor + Mist pass; no volume needed)."""
+    if not hasattr(scene, 'node_tree'):
+        print("[info] mist fog skipped (no compositor tree on this Blender version)")
+        return
+    scene.use_nodes = True
+    tree = scene.node_tree
+    for n in list(tree.nodes):
+        tree.nodes.remove(n)
+    scene.view_layers[0].use_pass_mist = True
+    ms = scene.world.mist_settings
+    ms.start, ms.depth = start, depth
+    try_set(ms, 'falloff', 'QUADRATIC')
+    rl = tree.nodes.new('CompositorNodeRLayers')
+    mul = tree.nodes.new('CompositorNodeMath')
+    mul.operation = 'MULTIPLY'
+    mul.inputs[1].default_value = strength
+    mx = tree.nodes.new('CompositorNodeMixRGB')
+    mx.blend_type = 'MIX'
+    mx.inputs[2].default_value = (color[0], color[1], color[2], 1.0)
+    co = tree.nodes.new('CompositorNodeComposite')
+    tree.links.new(rl.outputs['Mist'], mul.inputs[0])
+    tree.links.new(mul.outputs[0], mx.inputs[0])
+    tree.links.new(rl.outputs['Image'], mx.inputs[1])
+    tree.links.new(mx.outputs[0], co.inputs['Image'])
+
+
+def setup_ci_output(scene):
+    """CI: write PNG frames to ./frames/frame_####.png (only this job's slice)."""
+    r = scene.render
+    d = os.path.join(os.getcwd(), 'frames')
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    r.filepath = os.path.join(d, 'frame_####')
+    try_set(r.image_settings, 'media_type', 'IMAGE')
+    try:
+        r.image_settings.file_format = 'PNG'
+    except Exception:
+        warn("could not select PNG output")
+    try_set(r.image_settings, 'color_mode', 'RGB')
+    try_set(r.image_settings, 'color_depth', '8')
+    try_set(r.image_settings, 'compression', 15)
+    try_set(r, 'use_file_extension', True)
+    a, b = frame_slice()
+    scene.frame_start, scene.frame_end = a, b
+    return r.filepath
+
+
 def output_dir():
     blend = bpy.data.filepath
     if isinstance(blend, str) and blend:
@@ -786,7 +870,19 @@ def setup_render(scene, filename, exposure=0.0, volumetrics=False):
         cy = scene.cycles
         cy.samples = SAMPLES
         try_set(cy, 'use_denoising', True)
-        try_set(cy, 'max_bounces', 6)
+        try_set(cy, 'denoiser', 'OPENIMAGEDENOISE')
+        try_set(cy, 'use_adaptive_sampling', True)
+        try_set(cy, 'adaptive_threshold', 0.04)
+        try_set(cy, 'max_bounces', 4)
+        try_set(cy, 'diffuse_bounces', 2)
+        try_set(cy, 'glossy_bounces', 2)
+        try_set(cy, 'transmission_bounces', 2)
+        try_set(cy, 'volume_bounces', 1 if volumetrics else 0)
+        try_set(cy, 'transparent_max_bounces', 6)
+        try_set(cy, 'sample_clamp_indirect', 2.0)
+        try_set(cy, 'caustics_reflective', False)
+        try_set(cy, 'caustics_refractive', False)
+        try_set(r, 'use_persistent_data', True)
     else:
         ee = scene.eevee
         try_set(ee, 'taa_render_samples', SAMPLES)
@@ -826,6 +922,8 @@ def setup_render(scene, filename, exposure=0.0, volumetrics=False):
     path = os.path.join(output_dir(), filename)
     r.filepath = path
     try_set(r, 'use_file_extension', True)
+    if IS_CI:
+        return setup_ci_output(scene)
     try_set(r.image_settings, 'media_type', 'VIDEO')       # Blender 5.x
     try:
         r.image_settings.file_format = 'FFMPEG'
@@ -843,11 +941,16 @@ def setup_render(scene, filename, exposure=0.0, volumetrics=False):
 
 
 def finish(scene):
-    scene.frame_set(F_START)
     print("=" * 64)
-    print("Scene built.  Frames %d-%d @ %d fps  |  %dx%d  |  %.1f s" %
-          (F_START, F_END, FPS, RES_X, RES_Y, (F_END - F_START + 1) / float(FPS)))
-    print("MP4 output: %s" % scene.render.filepath)
+    if IS_CI:
+        print("CI mode: Cycles CPU | frames %d-%d of %d | %d%% of %dx%d | %d samples" %
+              (scene.frame_start, scene.frame_end, F_END, RESOLUTION_PERCENT, RES_X, RES_Y, SAMPLES))
+        print("Frames go to: %s" % scene.render.filepath)
+    else:
+        scene.frame_set(F_START)
+        print("Scene built.  Frames %d-%d @ %d fps  |  %dx%d  |  %.1f s" %
+              (F_START, F_END, FPS, RES_X, RES_Y, (F_END - F_START + 1) / float(FPS)))
+        print("MP4 output: %s" % scene.render.filepath)
     if RENDER_ON_RUN or bpy.app.background:
         bpy.ops.render.render(animation=True)
         print("Render finished.")
@@ -1292,7 +1395,7 @@ def plant_material(name, base, tip, rough=0.55, emit=0.08, uv_axis='Y'):
 #  SCENE 1 :  KING OF THE FOREST
 # ============================================================================
 OUTPUT_NAME = "King_of_the_Forest.mp4"
-USE_VOLUMETRICS = True                    # god-ray haze (slower). False = faster test renders
+USE_VOLUMETRICS = not IS_CI               # real volumetric god-ray haze (slower). On GitHub we use fake beams + mist
 SUN_DIR = vnorm((0.40, -0.74, -0.48))     # direction the sunlight travels (sun sits behind the lion)
 G = {}                                    # handles shared between build steps
 
@@ -2102,7 +2205,10 @@ def main():
         ("animation", step_animate),
     ])
     setup_render(scene, OUTPUT_NAME, exposure=0.25, volumetrics=USE_VOLUMETRICS)
-    add_glare(scene)
+    if IS_CI:
+        add_mist_fog(scene, (1.0, 0.82, 0.55), 10.0, 70.0, 0.6)
+    else:
+        add_glare(scene)
     finish(scene)
 
 
